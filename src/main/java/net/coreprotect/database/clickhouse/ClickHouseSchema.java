@@ -8,8 +8,10 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.StringJoiner;
 
 public final class ClickHouseSchema {
@@ -195,32 +197,44 @@ public final class ClickHouseSchema {
             }
         }
 
-        String columnQuery = "SELECT name,type,default_kind,default_expression FROM system.columns WHERE database=? AND table=? ORDER BY position";
+        String columnQuery = "SELECT name,type,default_kind,default_expression FROM system.columns WHERE database=? AND table=?";
         try (PreparedStatement statement = connection.prepareStatement(columnQuery)) {
             statement.setString(1, database);
             statement.setString(2, table);
             try (ResultSet resultSet = statement.executeQuery()) {
-                for (String[] expectedColumn : expectedColumns) {
-                    if (!resultSet.next()) {
-                        throw new SQLException("ClickHouse table has missing columns: " + table);
-                    }
-                    String definition = expectedColumn[1];
-                    String expectedDefault = defaultExpression(definition);
-                    String defaultKind = resultSet.getString(3);
-                    String defaultExpression = resultSet.getString(4);
-                    boolean defaultMatches = expectedDefault == null
-                            ? defaultKind == null || defaultKind.isEmpty()
-                            : "DEFAULT".equalsIgnoreCase(defaultKind) && normalizeSql(expectedDefault).equals(normalizeSql(defaultExpression));
-                    if (!expectedColumn[0].equals(resultSet.getString(1))
-                            || !normalizeSql(columnType(definition)).equals(normalizeSql(resultSet.getString(2)))
-                            || !defaultMatches) {
-                        throw new SQLException("ClickHouse table has an incompatible column definition: " + table + "." + expectedColumn[0]);
-                    }
-                }
-                if (resultSet.next()) {
-                    throw new SQLException("ClickHouse table has unexpected columns: " + table);
-                }
+                validateColumns(resultSet, table, expectedColumns);
             }
+        }
+    }
+
+    static void validateColumns(ResultSet resultSet, String table, String[][] expectedColumns) throws SQLException {
+        Map<String, String[]> actualColumns = new HashMap<>();
+        while (resultSet.next()) {
+            String name = resultSet.getString(1);
+            String[] definition = { resultSet.getString(2), resultSet.getString(3), resultSet.getString(4) };
+            if (name == null || actualColumns.put(name, definition) != null) {
+                throw new SQLException("ClickHouse table has an incompatible column definition: " + table);
+            }
+        }
+
+        for (String[] expectedColumn : expectedColumns) {
+            String[] actualColumn = actualColumns.remove(expectedColumn[0]);
+            if (actualColumn == null) {
+                throw new SQLException("ClickHouse table has missing columns: " + table);
+            }
+            String definition = expectedColumn[1];
+            String expectedDefault = defaultExpression(definition);
+            String defaultKind = actualColumn[1];
+            String defaultExpression = actualColumn[2];
+            boolean defaultMatches = expectedDefault == null
+                    ? defaultKind == null || defaultKind.isEmpty()
+                    : "DEFAULT".equalsIgnoreCase(defaultKind) && normalizeSql(expectedDefault).equals(normalizeSql(defaultExpression));
+            if (!normalizeSql(columnType(definition)).equals(normalizeSql(actualColumn[0])) || !defaultMatches) {
+                throw new SQLException("ClickHouse table has an incompatible column definition: " + table + "." + expectedColumn[0]);
+            }
+        }
+        if (!actualColumns.isEmpty()) {
+            throw new SQLException("ClickHouse table has unexpected columns: " + table);
         }
     }
 
@@ -300,7 +314,7 @@ public final class ClickHouseSchema {
         statements.add(view(names, ClickHouseFamily.SESSION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action"));
         statements.add(view(names, ClickHouseFamily.SIGN, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action,e.color AS color,e.color_secondary AS color_secondary,e.sign_data AS data,e.waxed AS waxed,e.face AS face,e.line_1 AS line_1,e.line_2 AS line_2,e.line_3 AS line_3,e.line_4 AS line_4,e.line_5 AS line_5,e.line_6 AS line_6,e.line_7 AS line_7,e.line_8 AS line_8"));
         statements.add(view(names, ClickHouseFamily.SKULL, "e.rowid AS rowid,e.time AS time,e.name AS owner,e.text AS skin"));
-        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,e.time AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
+        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,toUInt32(ifNull(e.data,toInt64(e.time))) AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
         statements.add(view(names, ClickHouseFamily.USERNAME_LOG, "e.rowid AS rowid,e.time AS time,e.uuid AS uuid,e.user_name AS `user`"));
         statements.add(currentView(names, ClickHouseFamily.VERSION, "e.rowid AS rowid,e.time AS time,e.version AS version"));
         statements.add(currentView(names, ClickHouseFamily.WORLD, "e.rowid AS rowid,e.id AS id,e.name AS world"));
@@ -308,13 +322,13 @@ public final class ClickHouseSchema {
 
     private static String view(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + events(names, family) + " AS e";
     }
 
     private static String currentView(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + currentEvents(names, family) + " AS e";
     }
 
@@ -335,13 +349,15 @@ public final class ClickHouseSchema {
     }
 
     static String binary(String value, String alias) {
-        String presentValue = "ifNull(" + value + ",'')";
-        String bytes = "arrayMap(i -> reinterpretAsInt8(substring(" + presentValue + ",i,1)),range(1,length(" + presentValue + ")+1))";
-        return "if(isNull(" + value + "),CAST([], 'Array(Int8)'),arrayConcat([toInt8(0)]," + bytes + ")) AS " + alias;
+        return value + " AS " + alias;
     }
 
     private static String location(String column) {
         return "if(e." + column + "_present=1,e." + column + ",NULL) AS " + column;
+    }
+
+    private static String locationKeys(ClickHouseFamily family) {
+        return family.isWorldScoped() ? ",e.wid AS _key_wid,e.x AS _key_x,e.z AS _key_z" : "";
     }
 
     private static String events(Names names, ClickHouseFamily family) {
