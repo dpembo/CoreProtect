@@ -231,3 +231,10 @@ publish/
 
 # Server side files
 server/*
+
+
+#############
+# vscode
+#############
+
+*.code-workspace
