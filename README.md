@@ -33,6 +33,7 @@ This is a personal fork of [PlayPro/CoreProtect](https://github.com/PlayPro/Core
 | `project.branch` | `development` | *(empty)* |
 | `maven.compiler.release` | `25` | `11` |
 
+The version is deliberately 100+ the core protect version to avoid any issues, but also to remain faithful to the actual release version of core protect CE.
 
 This fork also adds its own `.github/workflows/release.yml`, which upstream doesn't have, to publish tagged GitHub Releases of the built jar — separate from the existing `build.yml`, which is upstream's own `mvn verify` check and is left untouched.
 
