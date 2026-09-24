@@ -75,12 +75,23 @@ public class LookupRaw extends Queue {
     }
 
     static RawLookupPage performDuckDBLookupPage(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitCount, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
-        return performDuckDBLookupPage(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, 0, limitCount, -1L, null, restrictWorld, lookup, entityContainerId, rollbackState);
+        return performLookupPage(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, 0, limitCount, -1L, null, restrictWorld, lookup, entityContainerId, rollbackState);
     }
 
-    static RawLookupPage performDuckDBLookupPage(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, long knownTotalRows, LookupCursor cursor, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
-        if (!ConfigHandler.databaseType.isDuckDB()) {
-            throw new IllegalStateException("DuckDB lookup pages require DuckDB");
+    static RawLookupPage performLookupPage(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, long knownTotalRows, LookupCursor cursor, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
+        if (!ConfigHandler.databaseType.isColumnar()) {
+            throw new IllegalStateException("Lookup pages require a columnar database");
+        }
+        if (ConfigHandler.databaseType.isClickHouse() && knownTotalRows < 0L) {
+            throw new IllegalArgumentException("ClickHouse lookup pages require a known row count");
+        }
+        if (limitCount <= 0 || limitOffset < 0) {
+            throw new IllegalArgumentException("Lookup pages require a positive size and non-negative offset");
+        }
+        int currentPage = (limitOffset / limitCount) + 1;
+        if (cursor != null && (knownTotalRows < 0L || limitOffset == 0 || limitOffset % limitCount != 0
+                || cursor.getNextPage() != currentPage || cursor.getPageSize() != limitCount)) {
+            cursor = null;
         }
 
         boolean paused = false;
@@ -102,10 +113,12 @@ public class LookupRaw extends Queue {
                 boolean first = true;
                 while (results.next()) {
                     if (first) {
-                        totalRows = results.getLong("total_count");
-                        if (knownTotalRows < 0L && rowData != null) {
-                            for (int source = 0; source < rowData.length && source <= InventorySources.ENTITY_INTERACTION; source++) {
-                                rowData[source] = results.getLong("count_" + source);
+                        if (ConfigHandler.databaseType.isDuckDB()) {
+                            totalRows = results.getLong("total_count");
+                            if (knownTotalRows < 0L && rowData != null) {
+                                for (int source = 0; source < rowData.length && source <= InventorySources.ENTITY_INTERACTION; source++) {
+                                    rowData[source] = results.getLong("count_" + source);
+                                }
                             }
                         }
                         orderByTime = results.getBoolean("order_by_time");
@@ -129,9 +142,11 @@ public class LookupRaw extends Queue {
                 return new RawLookupPage(totalRows, Collections.emptyList(), null);
             }
             List<Object[]> rows = performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, -1, -1, restrictWorld, lookup, entityContainerId, rollbackState, pageRows, false);
-            int currentPage = limitCount > 0 ? (limitOffset / limitCount) + 1 : 1;
+            if (rows == null || rows.isEmpty()) {
+                return new RawLookupPage(totalRows, Collections.emptyList(), null);
+            }
             LookupCursor nextCursor = foundPageRow ? new LookupCursor(currentPage + 1, limitCount, cursorTime, cursorSource, cursorRowId, orderByTime) : null;
-            return new RawLookupPage(totalRows, rows == null ? Collections.emptyList() : rows, nextCursor);
+            return new RawLookupPage(totalRows, rows, nextCursor);
         }
         catch (Exception exception) {
             ErrorReporter.report(exception);
@@ -451,7 +466,7 @@ public class LookupRaw extends Queue {
     }
 
     private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, boolean summary, boolean countGroups, boolean includeGroupCount, LookupRollbackState rollbackState, Map<Integer, List<Long>> pageRows, boolean selectPageRows) {
-        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, summary, countGroups, includeGroupCount, rollbackState, pageRows, selectPageRows, 0, -1L, null);
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, summary, countGroups, includeGroupCount, rollbackState, pageRows, selectPageRows, limitOffset, -1L, null);
     }
 
     private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, boolean summary, boolean countGroups, boolean includeGroupCount, LookupRollbackState rollbackState, Map<Integer, List<Long>> pageRows, boolean selectPageRows, int pageOffset, long knownTotalRows, LookupCursor cursor) {
@@ -858,7 +873,7 @@ public class LookupRaw extends Queue {
 
             String actionPredicate = "";
             if (validAction) {
-                actionPredicate = buildActionPredicate(action, actionList, entityActionFilter);
+                actionPredicate = standardActionLookup ? buildActionPredicate(action, actionList, entityActionFilter) : "action IN(" + action + ")";
                 queryBlock = queryBlock + " " + actionPredicate + " AND";
             }
             else if (inventoryQuery || actionExclude.length() > 0 || includeBlock.length() > 0 || includeEntity.length() > 0 || excludeBlock.length() > 0 || excludeEntity.length() > 0) {
@@ -1063,7 +1078,7 @@ public class LookupRaw extends Queue {
                 baseQuery = appendMessageFilters(baseQuery, messageFilters, queryTable, messageFilterBindings);
             }
             else if (actionList.contains(LookupActions.SIGN)) {
-                baseQuery = appendSignMessageFilters(baseQuery, messageFilters, messageFilterBindings);
+                baseQuery = appendMessageFilters(baseQuery, messageFilters, "sign", messageFilterBindings);
             }
 
             boolean itemLookup = inventoryQuery;
@@ -1190,7 +1205,7 @@ public class LookupRaw extends Queue {
 
             if (selectPageRows) {
                 if (ConfigHandler.databaseType.isClickHouse()) {
-                    query = buildClickHousePageQuery(query, queryOrder, limitOffset, limitCount);
+                    query = buildClickHousePageQuery(query, pageOffset, limitCount, cursor, queryOrder.contains("time DESC"));
                 }
                 else {
                     query = buildDuckDBPageQuery(query, entityLocationCte, pageOffset, limitCount, knownTotalRows, cursor, queryOrder.contains("time DESC"));
@@ -1403,16 +1418,34 @@ public class LookupRaw extends Queue {
         return query.toString();
     }
 
-    private static String buildClickHousePageQuery(String sourceQuery, String queryOrder, int offset, int limit) {
+    private static String buildClickHousePageQuery(String sourceQuery, int offset, int limit, LookupCursor cursor, boolean orderByTime) {
         if (limit <= 0) {
             throw new IllegalArgumentException("ClickHouse lookup page size must be positive");
         }
         if (offset < 0) {
             throw new IllegalArgumentException("ClickHouse lookup page offset must not be negative");
         }
-        String candidateOrder = queryOrder.replace("rowid", "id");
-        return "SELECT tbl,id FROM (" + sourceQuery + ") AS coreprotectLookupCandidates"
-                + candidateOrder + " LIMIT " + limit + " OFFSET " + offset;
+        if (cursor != null && cursor.isOrderByTime() != orderByTime) {
+            cursor = null;
+        }
+        StringBuilder query = new StringBuilder("SELECT tbl,id,time AS sort_time,")
+                .append(orderByTime).append(" AS order_by_time FROM (").append(sourceQuery)
+                .append(") AS coreprotectLookupCandidates");
+        if (cursor != null) {
+            if (orderByTime) {
+                query.append(" WHERE (time,tbl,id)<(").append(cursor.getTime()).append(',')
+                        .append(cursor.getSource()).append(',').append(cursor.getRowId()).append(')');
+            }
+            else {
+                query.append(" WHERE id<").append(cursor.getRowId());
+            }
+        }
+        query.append(orderByTime ? " ORDER BY time DESC,tbl DESC,id DESC" : " ORDER BY id DESC")
+                .append(" LIMIT ").append(limit);
+        if (cursor == null && offset > 0) {
+            query.append(" OFFSET ").append(offset);
+        }
+        return query.toString();
     }
 
     private static String buildRollbackPredicate(LookupRollbackState rollbackState, boolean inventoryRollback) {
@@ -1495,6 +1528,31 @@ public class LookupRaw extends Queue {
             return baseQuery;
         }
 
+        List<String> included = new ArrayList<>();
+        List<String> excluded = new ArrayList<>();
+        for (String filter : messageFilters) {
+            if (filter != null && filter.startsWith("-")) {
+                excluded.add(filter.substring(1));
+            }
+            else {
+                included.add(filter);
+            }
+        }
+
+        return appendMessageFilters(baseQuery, included, excluded, table, bindings);
+    }
+
+    public static String appendMessageFilters(String baseQuery, List<String> included, List<String> excluded, String table, List<String> bindings) {
+        boolean sign = table.equals("sign");
+        String query = sign ? appendSignMessagePrefixes(baseQuery, included, bindings) : appendMessagePrefixes(baseQuery, included, table, bindings);
+        return appendMessageExclusions(query, excluded, sign, bindings);
+    }
+
+    private static String appendMessagePrefixes(String baseQuery, List<String> messageFilters, String table, List<String> bindings) {
+        if (messageFilters.isEmpty()) {
+            return baseQuery;
+        }
+
         if (ConfigHandler.databaseType.isDuckDB()) {
             StringBuilder query = new StringBuilder(baseQuery).append(" AND (");
             for (int index = 0; index < messageFilters.size(); index++) {
@@ -1530,8 +1588,8 @@ public class LookupRaw extends Queue {
         return query.append("))").toString();
     }
 
-    private static String appendSignMessageFilters(String baseQuery, List<String> messageFilters, List<String> bindings) {
-        if (messageFilters == null || messageFilters.isEmpty()) {
+    private static String appendSignMessagePrefixes(String baseQuery, List<String> messageFilters, List<String> bindings) {
+        if (messageFilters.isEmpty()) {
             return baseQuery;
         }
 
@@ -1584,6 +1642,43 @@ public class LookupRaw extends Queue {
         return query.append(")").toString();
     }
 
+    private static String appendMessageExclusions(String baseQuery, List<String> excluded, boolean sign, List<String> bindings) {
+        if (excluded.isEmpty()) {
+            return baseQuery;
+        }
+
+        String match = (ConfigHandler.databaseType.isColumnar() ? " NOT ILIKE ?" : " NOT LIKE ?")
+                + (ConfigHandler.databaseType.isClickHouse() ? "" : " ESCAPE '~'");
+        StringBuilder query = new StringBuilder(baseQuery);
+        for (String filter : excluded) {
+            String pattern = escapeLike(filter) + "%";
+            if (sign) {
+                query.append(" AND (face IS NULL OR (face=0 AND (");
+                appendExcludedSignLines(query, 1, 4, match);
+                query.append(")) OR (face<>0 AND (");
+                appendExcludedSignLines(query, 5, 8, match);
+                query.append(")))");
+                for (int line = 1; line <= 8; line++) {
+                    bindings.add(pattern);
+                }
+            }
+            else {
+                query.append(" AND (message IS NULL OR message").append(match).append(')');
+                bindings.add(pattern);
+            }
+        }
+        return query.toString();
+    }
+
+    private static void appendExcludedSignLines(StringBuilder query, int firstLine, int lastLine, String match) {
+        for (int line = firstLine; line <= lastLine; line++) {
+            if (line > firstLine) {
+                query.append(" AND ");
+            }
+            query.append("(line_").append(line).append(" IS NULL OR line_").append(line).append(match).append(')');
+        }
+    }
+
     private static void appendDuckDBSignLines(StringBuilder query, int firstLine, int lastLine) {
         for (int line = firstLine; line <= lastLine; line++) {
             if (line > firstLine) {
@@ -1630,20 +1725,15 @@ public class LookupRaw extends Queue {
                 + "WHEN action IN(" + positiveActions + ") THEN amount ELSE -amount END";
         String eligible = "((amount=-1 AND action IN(" + LookupActions.BLOCK_BREAK + "," + LookupActions.BLOCK_PLACE + ")) OR "
                 + "(amount<>-1 AND action BETWEEN " + ItemTransactionActions.REMOVE + " AND " + ItemTransactionActions.BUY + "))";
-        String countedSource = includeGroupCount
-                ? "SELECT summary_source.*,COUNT(*) OVER() AS record_count FROM (" + sourceQuery + ") summary_source"
-                : sourceQuery;
-        String recordCount = includeGroupCount ? ",record_count" : "";
-        String contributions = "SELECT " + userColumn + ",type," + delta + " AS delta" + recordCount + " FROM (" + countedSource + ") summary_counted_source WHERE " + eligible;
+        String contributions = "SELECT " + userColumn + ",type," + delta + " AS delta FROM (" + sourceQuery + ") summary_source WHERE " + eligible;
         String grouped = "SELECT " + userColumn + ",type,SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END) AS removed_amount,"
-                + "SUM(CASE WHEN delta>0 THEN delta ELSE 0 END) AS placed_amount,SUM(delta) AS net_amount"
-                + (includeGroupCount ? ",MAX(record_count) AS record_count " : " ")
+                + "SUM(CASE WHEN delta>0 THEN delta ELSE 0 END) AS placed_amount,SUM(delta) AS net_amount "
                 + "FROM (" + contributions + ") summary_contributions GROUP BY " + userColumn + ",type";
         if (countGroups) {
             return "SELECT COUNT(*) AS count FROM (" + grouped + ") summary_groups";
         }
 
-        String totalCount = includeGroupCount ? ",COUNT(*) OVER() AS total_count,record_count" : "";
+        String totalCount = includeGroupCount ? ",COUNT(*) OVER() AS total_count" : "";
         String query = "SELECT " + userColumn + ",type,removed_amount,placed_amount,net_amount AS amount" + totalCount + " FROM (" + grouped + ") summary_groups ORDER BY ABS(net_amount) DESC," + userColumn + " ASC,type ASC";
         if (limitOffset > -1 && limitCount > -1) {
             query += " LIMIT " + limitCount + " OFFSET " + limitOffset;
