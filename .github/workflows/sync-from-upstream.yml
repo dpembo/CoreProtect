@@ -1,0 +1,237 @@
+name: Sync from upstream
+
+# Save as .github/workflows/sync-upstream.yml on the default branch, then run it
+# from Actions -> "Sync from upstream" -> Run workflow.
+#
+# What it does:
+#   1. Merges upstream/<branch> into a NEW branch (sync/upstream-<timestamp>)
+#   2. Any conflict is resolved in favour of upstream (git merge -X theirs)
+#   3. Restores files that only exist in this repo under .github/workflows
+#      (your release action, and this workflow) plus anything in "keep_paths"
+#   4. Logs every conflict / overwritten file (warnings, job summary, PR body,
+#      and a full diff as a downloadable artifact)
+#   5. Pushes the branch, opens a PR, and optionally merges it
+#
+# Secret (recommended): SYNC_TOKEN = a PAT with "repo" + "workflow" scopes.
+#   - The default GITHUB_TOKEN is NOT allowed to push changes to files under
+#     .github/workflows, so the push fails if upstream touched any workflow file.
+#   - PRs opened with GITHUB_TOKEN don't trigger other workflows (no CI checks).
+#   - Auto-merge needs "Allow auto-merge" enabled in the repo settings.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Upstream repository (owner/name)
+        type: string
+        default: PlayPro/CoreProtect
+      upstream_branch:
+        description: Upstream branch to merge from
+        type: string
+        default: master
+      target_branch:
+        description: Branch in this repo to base the sync on and open the PR against
+        type: string
+        default: master
+      keep_paths:
+        description: Extra paths to always keep as ours (space separated). Workflow files that don't exist upstream are always kept.
+        type: string
+        default: ""
+      auto_merge:
+        description: Merge the PR automatically once it is created
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+      TARGET_BRANCH: ${{ inputs.target_branch }}
+      KEEP_PATHS: ${{ inputs.keep_paths }}
+      AUTO_MERGE: ${{ inputs.auto_merge }}
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream (upstream wins)
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.quotepath false
+
+          T="$RUNNER_TEMP/sync"
+          mkdir -p "$T"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          OURS=$(git rev-parse HEAD)
+          UP=$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")
+
+          if git merge-base --is-ancestor "$UP" "$OURS"; then
+            echo "Already up to date with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} - nothing to do."
+            echo "### Already up to date with \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BASE=$(git merge-base "$OURS" "$UP")
+          NEW_COMMITS=$(git rev-list --count "$OURS..$UP")
+
+          # --- Work out where both sides touched the same file -----------------
+          git diff --no-renames --name-only "$BASE" "$OURS" | sort > "$T/ours.txt"
+          git diff --no-renames --name-only "$BASE" "$UP"   | sort > "$T/theirs.txt"
+          comm -12 "$T/ours.txt" "$T/theirs.txt" > "$T/both.txt"
+
+          # --- Dry run (no working tree changes) to find real conflicts --------
+          set +e
+          git merge-tree --write-tree --name-only --no-messages "$OURS" "$UP" > "$T/mergetree.txt"
+          set -e
+          tail -n +2 "$T/mergetree.txt" | grep -v '^$' | sort -u > "$T/conflicts.txt" || true
+
+          # --- Real merge on a new branch, upstream wins on conflicts ----------
+          BRANCH="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+
+          git merge --no-ff --no-commit -X theirs "$UP" || true
+
+          # -X theirs can't resolve modify/delete or add/add style conflicts,
+          # so resolve anything left over in favour of upstream too.
+          git diff --name-only --diff-filter=U > "$T/unresolved.txt" || true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if git cat-file -e "$UP:$f" 2>/dev/null; then
+              git checkout "$UP" -- "$f"
+            else
+              git rm -rf --quiet -- "$f"
+            fi
+          done < "$T/unresolved.txt"
+
+          # --- Paths that stay ours --------------------------------------------
+          # Workflow files that exist here but not upstream (e.g. the release
+          # action, and this workflow itself), plus any keep_paths input.
+          : > "$T/keep.txt"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            git cat-file -e "$UP:$f" 2>/dev/null || echo "$f" >> "$T/keep.txt"
+          done < <(git ls-tree -r --name-only "$OURS" -- .github/workflows)
+          for p in $KEEP_PATHS; do echo "$p" >> "$T/keep.txt"; done
+
+          while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            if git cat-file -e "$OURS:$p" 2>/dev/null; then
+              git rm -rf --quiet --ignore-unmatch -- "$p"
+              git checkout "$OURS" -- "$p"
+            else
+              echo "::notice::keep path '$p' does not exist in this repo, skipped"
+            fi
+          done < "$T/keep.txt"
+
+          git commit --quiet \
+            -m "Merge ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (upstream wins)" \
+            -m "Conflicts resolved in favour of upstream. Files kept from this repo are listed in the PR description."
+          M=$(git rev-parse HEAD)
+
+          # --- Logging ----------------------------------------------------------
+          : > "$T/overwrite.patch"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            git diff "$OURS" "$M" -- "$f" >> "$T/overwrite.patch" || true
+          done < "$T/both.txt"
+
+          {
+            echo "## Upstream sync: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`"
+            echo
+            echo "- Upstream commit: \`${UP:0:10}\` (${NEW_COMMITS} new commits)"
+            echo "- Merge base: \`${BASE:0:10}\`"
+            echo "- Sync branch: \`${BRANCH}\`"
+            echo
+            echo "### Overwritten: conflicts resolved in favour of upstream"
+            if [ -s "$T/conflicts.txt" ]; then
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                stat=$(git diff --numstat "$OURS" "$M" -- "$f" | awk '{print "+"$1" / -"$2" lines vs ours"}')
+                echo "- \`$f\` ${stat:-no net change}"
+                echo "::warning file=$f::Conflict - upstream version kept, local change overwritten"
+              done < "$T/conflicts.txt"
+            else
+              echo "_None. No conflicting changes._"
+            fi
+            echo
+            echo "### Modified on both sides, merged without conflict"
+            comm -13 "$T/conflicts.txt" <(sort -u "$T/both.txt") | sed 's/.*/- `&`/' || true
+            echo
+            echo "### Kept from this repo (not taken from upstream)"
+            if [ -s "$T/keep.txt" ]; then sed 's/.*/- `&`/' "$T/keep.txt"; else echo "_None_"; fi
+            echo
+            echo "_Full diff of our side vs the merge result for every file modified on both sides is attached to the run as the \`overwrite-report\` artifact._"
+          } > "$T/report.md"
+
+          cat "$T/report.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$T/report.md"
+
+          echo "changed=true"      >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH"    >> "$GITHUB_OUTPUT"
+          echo "report=$T/report.md" >> "$GITHUB_OUTPUT"
+          echo "patch=$T/overwrite.patch" >> "$GITHUB_OUTPUT"
+
+      - name: Upload overwrite report
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: overwrite-report
+          path: |
+            ${{ steps.merge.outputs.report }}
+            ${{ steps.merge.outputs.patch }}
+
+      - name: Push branch and open PR
+        if: steps.merge.outputs.changed == 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          REPORT: ${{ steps.merge.outputs.report }}
+        run: |
+          set -euo pipefail
+          git push origin "$BRANCH"
+
+          # PR bodies are capped at 65536 characters
+          head -c 60000 "$REPORT" > "$RUNNER_TEMP/pr-body.md"
+
+          # --repo matters: in a fork, gh would otherwise default to the parent repo
+          PR_URL=$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "Merge from upstream (${UPSTREAM_REPO}@${UPSTREAM_BRANCH})" \
+            --body-file "$RUNNER_TEMP/pr-body.md")
+
+          echo "PR: $PR_URL"
+          echo "**Pull request:** $PR_URL" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$AUTO_MERGE" = "true" ]; then
+            # Prefer GitHub auto-merge (waits for required checks); if the repo has
+            # no protection / auto-merge disabled, fall back to merging straight away.
+            # Use a merge commit (not squash) so the next sync has a proper merge base.
+            gh pr merge "$PR_URL" --repo "$GITHUB_REPOSITORY" --merge --auto \
+              || gh pr merge "$PR_URL" --repo "$GITHUB_REPOSITORY" --merge
+          fi
