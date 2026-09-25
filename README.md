@@ -25,15 +25,9 @@ CoreProtect is the [#1 anti-griefing plugin](https://bstats.org/plugin/bukkit/Co
 
 ## About this fork
 
-This is a personal fork of [PlayPro/CoreProtect](https://github.com/PlayPro/CoreProtect), kept in sync with upstream's `master` branch. As of the last sync, every plugin source file is identical to upstream — the fork carries no code changes of its own. The differences are confined to build configuration:
+This is a personal fork of [PlayPro/CoreProtect](https://github.com/PlayPro/CoreProtect), kept in sync with upstream's `master` branch. As of the last sync, every plugin source file is identical to upstream — the fork carries no code changes of its own. The differences are confined to build configuration alone
 
-| | This fork | Upstream (`PlayPro/CoreProtect`) |
-| --- | --- | --- |
-| `pom.xml` version | `124.0.0` | `24.0` |
-| `project.branch` | `development` | *(empty)* |
-| `maven.compiler.release` | `25` | `11` |
-
-The version is deliberately 100+ the core protect version to avoid any issues, but also to remain faithful to the actual release version of core protect CE.
+The version is deliberately 100+x.x the core protect version to avoid any issues, but also to remain faithful to the actual release version of core protect CE.
 
 This fork also adds its own `.github/workflows/release.yml`, which upstream doesn't have, to publish tagged GitHub Releases of the built jar — separate from the existing `build.yml`, which is upstream's own `mvn verify` check and is left untouched.
 
